@@ -29,6 +29,22 @@ pub enum VrxMode {
     Diversity = 1,
 }
 
+#[derive(Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Freq(u16);
+
+impl From<u16> for Freq {
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialEq for Freq {
+    fn eq(&self, other: &Self) -> bool {
+        freq_to_reg_value(self.0) == freq_to_reg_value(other.0)
+    }
+}
+
 fn freq_to_reg_value(freq: u16) -> u32 {
     let x = (freq as u32 - 479) / 2;
     ((x / 32) << 7) | (x % 32)
@@ -66,10 +82,15 @@ where
         irq: Irq<'d, PIO, 0>,
         pins: Rtc6715Pins<'d, CS, DIO, CLK>,
     ) -> Self {
+        // Rtc6715 implements SPI like protocol
+        // During write cycle it samples data on the rising edge of the clock,
+        // during read cycle data bits are sent on the falling edge of the clock
         let program = pio_asm!(
             ".side_set 1"
 
             ".wrap_target"
+
+            "pull           side 0"
 
             // write out 4-bit address
             "set x, 3       side 0"
@@ -81,32 +102,29 @@ where
             "out x, 1       side 0"
             "jmp !x read    side 0"
 
-            // write out r/w bit
             "write:"
+            // write out r/w bit
             "set pins, 1    side 0"
             "set x, 19      side 1"
             // write out 20 data bits
             "odata:"
             "out pins, 1    side 0"
             "jmp x-- odata  side 1"
-            // discard unused 7 bits
-            "out null, 7    side 0"
             "jmp end        side 0"
 
-            // write out r/w bit
             "read:"
+            // write out r/w bit
             "set pins, 0    side 0"
             "set x, 19      side 1"
             // switch pin direction to input
-            "set pindirs, 0 side 1"
+            "set pindirs, 0 side 0"
             // read in 20 data bits
             "idata:"
             "in pins, 1     side 1"
             "jmp x-- idata  side 0"
+            "in null, 12    side 0"
             // restore pin direction to output
             "set pindirs, 1 side 0"
-            // discard unused 27 bits
-            "out null, 27   side 0"
 
             "end:"
             "push           side 0"
@@ -124,7 +142,6 @@ where
         cfg.set_in_pins(&[&pin_io]);
         cfg.set_set_pins(&[&pin_io]);
         cfg.shift_out.direction = ShiftDirection::Right;
-        cfg.shift_out.auto_fill = true;
         cfg.shift_in.direction = ShiftDirection::Right;
         cfg.clock_divider = SPI_CLOCK_DIVIDER;
 
@@ -132,7 +149,7 @@ where
 
         spi_sm.set_pin_dirs(Direction::Out, &[&pin_clk, &pin_io]);
         spi_sm.set_pins(Level::Low, &[&pin_clk, &pin_io]);
-        spi_sm.set_enable(false);
+        spi_sm.set_enable(true);
 
         let mode_program = pio_asm!(
             ".side_set 1"
@@ -159,7 +176,7 @@ where
         mode_sm.set_config(&cfg);
         mode_sm.set_pin_dirs(Direction::Out, &[&pin_clk]);
         mode_sm.set_pins(Level::Low, &[&pin_clk]);
-        mode_sm.set_enable(false);
+        mode_sm.set_enable(true);
 
         Self {
             cs: Output::new(pins.cs, Level::High),
@@ -170,15 +187,8 @@ where
     }
 
     async fn read_write(&mut self, data: u32) -> u32 {
-        self.spi_sm.set_enable(true);
-
         self.spi_sm.tx().wait_push(data).await;
-
-        self.spi_sm.rx().wait_pull().await;
-        let res = self.spi_sm.rx().pull();
-
-        self.spi_sm.set_enable(false);
-
+        let res = self.spi_sm.rx().wait_pull().await;
         res
     }
 
@@ -200,35 +210,39 @@ where
         self.read_write(data).await
     }
 
-    pub async fn set_mode(&mut self, mode: VrxMode, freq: u16) {
+    pub async fn set_mode(&mut self, mode: VrxMode, freq: Freq) {
         if let VrxMode::Mix = mode {
-            self.mode_sm.set_enable(true);
             // 100 us * 1000 = 100 ms
             self.mode_sm.tx().push(1000);
 
             self.irq.wait().await;
-            self.mode_sm.set_enable(false);
 
             Timer::after_millis(500).await;
         }
 
         self.write_reg(SYNTHESIZER_REG_A, 0x8).await;
         Timer::after_micros(500).await;
+        // Do we really need second write?
+        // Althogh ELRS backpack does it
+        self.write_reg(SYNTHESIZER_REG_A, 0x8).await;
         self.set_freq(freq).await;
     }
 
-    pub async fn get_freq(&mut self) -> u16 {
+    pub async fn get_freq(&mut self) -> Freq {
         self.cs.set_low();
         let reg_value = self.read_reg(SYNTHESIZER_REG_B).await;
         self.cs.set_high();
-        reg_value_to_freq(reg_value)
+        Freq(reg_value_to_freq(reg_value))
     }
 
-    pub async fn set_freq(&mut self, freq: u16) {
-        let reg_value = freq_to_reg_value(freq);
+    pub async fn set_freq(&mut self, freq: Freq) {
+        let reg_value = freq_to_reg_value(freq.0);
         self.cs.set_low();
         self.write_reg(SYNTHESIZER_REG_A, 0x8).await;
         self.write_reg(SYNTHESIZER_REG_B, reg_value).await;
         self.cs.set_high();
+
+        // Give it some time to apply new frequency
+        Timer::after_millis(50).await;
     }
 }
