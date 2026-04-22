@@ -3,7 +3,7 @@
 use embassy_rp::gpio::{Level, Output, Pin};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{Common, Config, Direction, Instance, Irq, PioPin, ShiftDirection, StateMachine};
-use embassy_rp::Peripheral;
+use embassy_rp::Peri;
 use embassy_time::Timer;
 use fixed::FixedU32;
 use fixed::types::extra::U8;
@@ -40,15 +40,10 @@ fn reg_value_to_freq(v: u32) -> u16 {
     479 + (n * 32 + a) * 2
 }
 
-pub struct Rtc6715Pins<CS, DIO, CLK>
-where
-    CS: Peripheral<P: Pin>,
-    DIO: Peripheral<P: PioPin>,
-    CLK: Peripheral<P: PioPin>,
-{
-    pub cs: CS,
-    pub dio: DIO,
-    pub clk: CLK,
+pub struct Rtc6715Pins<'d, CS: Pin, DIO: PioPin, CLK: PioPin> {
+    pub cs: Peri<'d, CS>,
+    pub dio: Peri<'d, DIO>,
+    pub clk: Peri<'d, CLK>,
 }
 
 /// Rtc6715 chip driven by PIO (uses non-standard SPI).
@@ -64,18 +59,13 @@ where
     PIO: Instance,
 {
     /// Create a new instance of PioSpi.
-    pub fn new<CS, DIO, CLK>(
+    pub fn new<CS: Pin, DIO: PioPin, CLK: PioPin>(
         common: &mut Common<'d, PIO>,
         mut spi_sm: StateMachine<'d, PIO, SM>,
         mut mode_sm: StateMachine<'d, PIO, MODE_SM>,
         irq: Irq<'d, PIO, 0>,
-        pins: Rtc6715Pins<CS, DIO, CLK>,
-    ) -> Self
-    where
-        CS: Peripheral<P: Pin> + 'd,
-        DIO: Peripheral<P: PioPin> + 'd,
-        CLK: Peripheral<P: PioPin> + 'd,
-    {
+        pins: Rtc6715Pins<'d, CS, DIO, CLK>,
+    ) -> Self {
         let program = pio_asm!(
             ".side_set 1"
 
@@ -187,7 +177,7 @@ where
         self.spi_sm.rx().wait_pull().await;
         let res = self.spi_sm.rx().pull();
 
-        self.spi_sm.set_enable(true);
+        self.spi_sm.set_enable(false);
 
         res
     }
